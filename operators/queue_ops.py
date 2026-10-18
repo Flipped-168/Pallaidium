@@ -1181,7 +1181,8 @@ def _run_job(snapshot: dict, result_queue, cancel_event, progress_store) -> None
         # replied with no image) would otherwise be reported COMPLETED with an
         # empty path and silently skip strip insertion — surface it as a failure
         # so the download problem is visible instead of "Done but no strip".
-        if otype in ("image", "movie", "audio"):
+        # (A multi-stem result is a JSON map of files, checked per stem at insertion.)
+        if otype in ("image", "movie", "audio") and not str(out_path or "").startswith("MULTI_STEM:"):
             if not out_path or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
                 raise RuntimeError(
                     f"{otype.capitalize()} generation produced no output file — the "

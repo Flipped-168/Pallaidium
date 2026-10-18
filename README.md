@@ -217,6 +217,8 @@ excluded from the built add-on.
 
 ## Change Log
 
+2026-10-18: Add: **SAM-Audio Large** — Meta's [facebook/sam-audio-large](https://huggingface.co/facebook/sam-audio-large) sound-isolation model (SAM License). Select a SOUND or MOVIE strip, pick "Sound Isolation: SAM-Audio Large" in the Audio panel and describe the sound in the prompt (e.g. `a dog barking`, `female speech`, `piano`): the strip is split into two SOUND strips, **target** (the described sound) and **residual** (everything else), at 48 kHz. Weights load from the ungated mirror [ml-resources/sam-audio-large](https://huggingface.co/ml-resources/sam-audio-large) (14.9 GB download, ~7.6 GB VRAM in bf16) plus T5-base; no Hugging Face login is needed. Long clips are separated in 30 s chunks. Span prompts, visual prompts and reranking are not supported yet. Needs **Install Dependencies** for `sam-audio`, `dacvae`, `perception-models`, `descript-audiotools` and `argbind`, then a restart of Blender.
+
 2026-10-17: Add: **MOSS-Image Base** and **MOSS-Image SFT** — OpenMOSS' 5B single-stream DiT ([Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base), the LoRA training target; [SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT), fine-tuned for cleaner text grouping and layout), Apache-2.0. Strong English/Chinese text rendering (put `
 ` or real line breaks in the prompt to control line breaks), prompts up to 4K tokens, arbitrary aspect ratios from 0.25 to 4 megapixels (1-2 MP recommended; sizes snap to multiples of 16). Defaults follow the official guide: 50 Euler steps, CFG 3 (3-6 for short prompts), shift 5, and **Layer Guidance** "Uncond Skip" on layer 22; "Standard SLG" (scale 3) and "Off" (the most realistic look, but details may collapse) are selectable, as are the skip layers (22, 24 and 26 all help) and the shift. Suggested negative prompt: `nsfw, worst quality, bad anatomy, watermark, jpeg artifact`. Features:
 - **Layouts via the Box Editor:** Box Editor JSON and FLUX.3 layout prompts are converted to MOSS-Image's centred-pixel `yxyx` layout JSON for the output size. A layout draft from the official `moss-image-prompt-enhancer` skill (`abs`/`xyxy` with its own width/height) is compiled and rescaled to the output size, and a compiled MOSS layout prompt passes through unchanged. (Experimental upstream.)
@@ -644,6 +646,7 @@ https://github.com/tin2tin/Generative_AI/assets/1322593/2dd2d2f1-a1f6-4562-8116-
 - [YuE2-3B (songs with vocals)](https://huggingface.co/OzzyGT/YuE2-3B-Diffusers)
 - [stabilityai/stable-audio-open-1.0](https://huggingface.co/stabilityai/stable-audio-open-1.0)
 - [Stem Splitter (demucs-onnx)](https://github.com/StemSplit/demucs-onnx)
+- [SAM-Audio Large (sound isolation)](https://huggingface.co/facebook/sam-audio-large) ([code](https://github.com/facebookresearch/sam-audio))
 
 ### Background Removal:
 - [BiRefNet_HR](https://huggingface.co/ZhengPeng7/BiRefNet_HR)

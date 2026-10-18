@@ -1572,6 +1572,15 @@ class DependencyManager:
             "kanade-tokenizer @ git+https://github.com/frothywater/kanade-tokenizer.git",
             "torcheval",
             "torchao",
+            # SAM-Audio (sound isolation). The installer is --no-deps, so only the
+            # pieces sam_audio imports are listed: dacvae needs descript-audiotools +
+            # argbind; perception-models supplies `core` (xformers/wandb are shimmed
+            # in the plugin, not installed). Rankers (imagebind/audiobox) are unused.
+            "descript-audiotools",
+            "argbind",
+            "dacvae @ git+https://github.com/facebookresearch/dacvae.git",
+            "perception-models @ git+https://github.com/facebookresearch/perception_models@unpin-deps",
+            "sam-audio @ git+https://github.com/facebookresearch/sam-audio.git",
             # spacy and model wheel: Windows/macOS install here; Linux uses get_phase_linux_binary_only()
         ]
 
