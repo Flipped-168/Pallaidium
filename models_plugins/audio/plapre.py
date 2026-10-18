@@ -128,7 +128,7 @@ class Plapre3Plugin(ModelPlugin):
     def load(self, prefs, scene, **kw):
         import torch
         from huggingface_hub import hf_hub_download
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from kanade_tokenizer import KanadeModel, load_vocoder
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -142,9 +142,21 @@ class Plapre3Plugin(ModelPlugin):
             from transformers import PreTrainedTokenizerFast
             tokenizer = PreTrainedTokenizerFast.from_pretrained(_REPO, local_files_only=local)
 
+        # config.json carries two RoPE thetas: top-level rope_theta=10000 (what
+        # transformers 4.57 read when the model was trained) and
+        # rope_parameters.rope_theta=100000 (what transformers 5 reads). The
+        # 100000 one makes long sentences loop and repeat words, so force the
+        # top-level value.
+        config = AutoConfig.from_pretrained(_REPO, local_files_only=local)
+        with open(hf_hub_download(_REPO, "config.json", local_files_only=local), encoding="utf-8") as fh:
+            trained_theta = json.load(fh).get("rope_theta")
+        rope_params = getattr(config, "rope_parameters", None)
+        if trained_theta and isinstance(rope_params, dict) and rope_params.get("rope_theta") != trained_theta:
+            config.rope_parameters = {**rope_params, "rope_theta": trained_theta}
+
         # fp32 is the training precision; lower precision adds end-of-utterance artifacts.
         model = AutoModelForCausalLM.from_pretrained(
-            _REPO, dtype=torch.float32, local_files_only=local,
+            _REPO, config=config, dtype=torch.float32, local_files_only=local,
         ).to(device).eval()
 
         speaker_proj = torch.nn.Linear(128, model.config.hidden_size)
