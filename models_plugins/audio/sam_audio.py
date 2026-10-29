@@ -1,7 +1,7 @@
 """Text-prompted sound isolation via SAM-Audio large (Meta).
 
 Describe a sound ("a dog barking", "female speech", "piano") and the model
-splits the input audio/video strip into that sound (target) and everything
+splits the input SOUND strip into that sound (target) and everything
 else (residual). Both come back as SOUND strips.
 
 Weights come from the ungated mirror ml-resources/sam-audio-large (same files
@@ -12,6 +12,7 @@ model runs in bf16 and long clips are separated in 30 s chunks.
 """
 
 import json
+import math
 import os
 import sys
 
@@ -53,9 +54,9 @@ class SamAudioPlugin(ModelPlugin):
     MODEL_ID     = _REPO
     DISPLAY_NAME = "Sound Isolation: SAM-Audio Large"
     MODEL_TYPE   = "audio"
-    DESCRIPTION  = "Isolate any sound from an audio/video strip with a text description; outputs the sound and the remainder"
+    DESCRIPTION  = "Isolate any sound from a SOUND strip with a text description; outputs the sound and the remainder"
 
-    # The audio/video strip is the mixture; the prompt names the sound to isolate.
+    # The SOUND strip is the mixture; the prompt names the sound to isolate.
     INPUTS       = InputSpec.PROMPT | InputSpec.AUDIO_REF
     UI_SECTIONS  = [UISection.PROMPT, UISection.SEED]
     PARAMS       = ParamSpec()
@@ -126,7 +127,9 @@ class SamAudioPlugin(ModelPlugin):
         audio_path = inputs.audio_ref
         description = (inputs.prompt or "").strip()
         if not audio_path:
-            raise ValueError("No audio reference path — select a SOUND or MOVIE strip as input.")
+            # A MOVIE strip reaches the queue without a trimmed audio render; its audio is the
+            # separate SOUND strip next to it, which the queue trims to the strip's range.
+            raise ValueError("No audio input — select a SOUND strip (the audio strip of a movie, not the MOVIE strip).")
         if not description:
             raise ValueError("Describe the sound to isolate in the prompt (e.g. 'a dog barking').")
 
@@ -157,16 +160,30 @@ class SamAudioPlugin(ModelPlugin):
             pieces[-2:] = [torch.cat(pieces[-2:])]
 
         print(f"SAM-Audio | prompt={description!r} | {wav.shape[0] / sample_rate:.1f}s in {len(pieces)} chunk(s)")
-        self.set_phase(inputs, "Separating…")
-        targets, residuals = [], []
-        for i, piece in enumerate(pieces):
-            batch = processor(descriptions=[description], audios=[piece.unsqueeze(0)]).to(device)
-            with torch.inference_mode(), torch.autocast(device, dtype=dtype, enabled=(device == "cuda")):
-                result = model.separate(batch, predict_spans=False, reranking_candidates=1)
-            targets.append(result.target[0].float().cpu())
-            residuals.append(result.residual[0].float().cpu())
+        # separate() has no callback; the ODE solver calls the transformer once per function
+        # evaluation (midpoint = 2 per step), so a forward hook on it drives the progress bar.
+        from sam_audio.model.model import DFLT_ODE_OPT
+        evals_per_chunk = 2 * math.ceil(1 / DFLT_ODE_OPT["options"]["step_size"])
+        total_evals = evals_per_chunk * len(pieces)
+        done = [0]
+
+        def _tick(*_):
+            done[0] += 1
             if inputs.progress_fn is not None:
-                inputs.progress_fn(i + 1, len(pieces))
+                inputs.progress_fn(min(done[0], total_evals), total_evals)
+
+        hook = model.transformer.register_forward_hook(_tick)
+        targets, residuals = [], []
+        try:
+            for i, piece in enumerate(pieces):
+                self.set_phase(inputs, f"Separating {i + 1}/{len(pieces)}…" if len(pieces) > 1 else "Separating…")
+                batch = processor(descriptions=[description], audios=[piece.unsqueeze(0)]).to(device)
+                with torch.inference_mode(), torch.autocast(device, dtype=dtype, enabled=(device == "cuda")):
+                    result = model.separate(batch, predict_spans=False, reranking_candidates=1)
+                targets.append(result.target[0].float().cpu())
+                residuals.append(result.residual[0].float().cpu())
+        finally:
+            hook.remove()
 
         self.set_phase(inputs, "Saving…")
         base = os.path.splitext(os.path.basename(audio_path))[0]

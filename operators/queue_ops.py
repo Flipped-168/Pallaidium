@@ -89,6 +89,21 @@ _FLUX3_CARDS = (
     "black-forest-labs/flux-3-image-klein-base",
 )
 
+# Bria Fibo 2.0 settings carried through the queue: (name, default).
+# The reference images ride the shared klein_strip_N pickers; JSON captions and
+# <image_N> references ride the prompt text itself.
+_FIBO2_DEFAULTS = (
+    ("fibo2_weights",     "sdnq8"),
+    ("fibo2_render_text", True),
+    ("fibo2_font_path",   ""),
+)
+_FIBO2_CARDS = (
+    "ml-resources/Fibo-2.0-dev",
+    "ml-resources/Fibo-2.0-edit-turbo",
+    "briaai/Fibo-2.0-dev",          # strips made with the gated originals
+    "briaai/Fibo-2.0-edit-turbo",
+)
+
 # MOSS-Image Base / SFT settings carried through the queue: (name, default).
 # The layout boxes ride the prompt text itself.
 _MOSSIMG_DEFAULTS = (
@@ -115,6 +130,12 @@ _PLAPRE_DEFAULTS = (
 # file shows what BOTH the immediate path and the queue path decided.
 # ---------------------------------------------------------------------------
 import time as _time
+
+
+def _dbg(*args, **kwargs):
+    """Queue debug trace; silent unless PALLAIDIUM_DEBUG is set."""
+    if os.environ.get("PALLAIDIUM_DEBUG"):
+        print(*args, **kwargs)
 _PALLAIDIUM_DIAG_LOG = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                                     "_diag_scene_input.log")
 
@@ -352,8 +373,13 @@ class RenderQueueJob(PropertyGroup):
     flux3_prompt_upsampling: BoolProperty(default=False)
     flux3_pup_quant:         StringProperty(default="int8")
 
+    # Bria Fibo 2.0 (see _FIBO2_DEFAULTS)
+    fibo2_weights:           StringProperty(default="sdnq8")
+    fibo2_render_text:       BoolProperty(default=True)
+    fibo2_font_path:         StringProperty(default="")
+
     # MOSS-Image (see _MOSSIMG_DEFAULTS)
-    mossimg_weights:         StringProperty(default="sdnq8")
+    mossimg_weights:        StringProperty(default="sdnq8")
     mossimg_guidance_mode:   StringProperty(default="uncond")
     mossimg_skip_layers:     StringProperty(default="22")
     mossimg_slg_scale:       FloatProperty(default=3.0)
@@ -405,6 +431,11 @@ class RenderQueueJob(PropertyGroup):
 
     # minimax_h3 — resolved second reference strip path (ref2va)
     h3_ref_strip_path:           StringProperty(default="")
+    # pika_h3_flex — resolved "Last Frame" strip path (fl2va last keyframe)
+    h3_last_strip_path:          StringProperty(default="")
+    # Source strip names (persisted to metadata so Redo can restore picker state)
+    h3_ref_strip:                StringProperty(default="")
+    h3_last_strip:               StringProperty(default="")
 
     # ltx23_multi_ic_lora — IC-LoRA control paths + params
     ltx23ic_control_video_path:  StringProperty(default="")
@@ -685,6 +716,7 @@ def _run_job(snapshot: dict, result_queue, cancel_event, progress_store) -> None
             kontext_strip_1                = "",
             kontext_strip_1_path           = snapshot.get("kontext_strip_1_path", ""),
             h3_ref_strip_path               = snapshot.get("h3_ref_strip_path", ""),
+            h3_last_strip_path              = snapshot.get("h3_last_strip_path", ""),
             qwen_strip_1_path              = snapshot.get("qwen_strip_1_path", ""),
             qwen_strip_2_path              = snapshot.get("qwen_strip_2_path", ""),
             qwen_strip_3_path              = snapshot.get("qwen_strip_3_path", ""),
@@ -770,6 +802,7 @@ def _run_job(snapshot: dict, result_queue, cancel_event, progress_store) -> None
             **{_k: snapshot.get(_k, _d) for _k, _d in _YUE2_DEFAULTS},
             **{_k: snapshot.get(_k, _d) for _k, _d in _KREA2_REF_DEFAULTS},
             **{_k: snapshot.get(_k, _d) for _k, _d in _FLUX3_DEFAULTS},
+            **{_k: snapshot.get(_k, _d) for _k, _d in _FIBO2_DEFAULTS},
             **{_k: snapshot.get(_k, _d) for _k, _d in _MOSSIMG_DEFAULTS},
             **{_k: snapshot.get(_k, _d) for _k, _d in _PLAPRE_DEFAULTS},
             flux3_final_prompt    = "",  # set by the FLUX.3 plugin when PUP/layout rewrote the prompt
@@ -848,11 +881,14 @@ def _run_job(snapshot: dict, result_queue, cancel_event, progress_store) -> None
             pipe_obj = model_cache
             print(f"[Queue] Reusing cached model: {model_card} ({mode}) schematic={_schematic_mode or '-'}")
         else:
-            # Release a different model (or same model with incompatible mode)
+            # Release a different model (or same model with incompatible mode or
+            # LoRA set) — otherwise the old pipeline stays alive through load()
+            # and its GPU-resident parts double up with the new one's.
             if (model_cache is not None
                     and (model_cache.get("last_model_card") != model_card
                          or model_cache.get("last_mode") != mode
                          or model_cache.get("last_schematic_mode", "") != _schematic_mode
+                         or model_cache.get("last_lora_key", "[]") != _lora_key
                          or model_cache.get("last_load_variant", "") != _load_variant)):
                 release_model_cache(model_cache)
             clear_cuda_cache()
@@ -1276,6 +1312,16 @@ def _run_job(snapshot: dict, result_queue, cancel_event, progress_store) -> None
             "klein_visible_strips":        snapshot.get("klein_visible_strips", 3),
             **{f"klein_strip_{_n}":      snapshot.get(f"klein_strip_{_n}", "")      for _n in range(1, 10)},
             **{f"klein_strip_{_n}_path": snapshot.get(f"klein_strip_{_n}_path", "") for _n in range(1, 10)},
+            # MiniMax H3 / Pika H3 Flex Ref Strip + Last Frame — names (drive Redo) + resolved paths (record)
+            **{_k: snapshot.get(_k, "") for _k in (
+                "h3_ref_strip", "h3_last_strip", "h3_ref_strip_path", "h3_last_strip_path")},
+            # Generic input paths — read by the metadata writer's input-paths
+            # block (only non-empty values are written) and restored on Redo.
+            **{_k: snapshot.get(_k, "") for _k in (
+                "image_path", "last_image_path", "middle_images_json",
+                "movie_path", "sound_path", "ref_audio_path", "ref_text",
+                "kontext_strip_1_path",
+                "qwen_strip_1_path", "qwen_strip_2_path", "qwen_strip_3_path")},
             "florence2_send_to_mask":      snapshot.get("florence2_send_to_mask",      False),
             "florence2_source_image_path": snapshot.get("image_path") or snapshot.get("movie_path") or "",
             # Chatterbox Multilingual
@@ -1293,6 +1339,7 @@ def _run_job(snapshot: dict, result_queue, cancel_event, progress_store) -> None
             **{_k: snapshot.get(_k, _d) for _k, _d in _YUE2_DEFAULTS},
             **{_k: snapshot.get(_k, _d) for _k, _d in _KREA2_REF_DEFAULTS},
             **{_k: snapshot.get(_k, _d) for _k, _d in _FLUX3_DEFAULTS},
+            **{_k: snapshot.get(_k, _d) for _k, _d in _FIBO2_DEFAULTS},
             **{_k: snapshot.get(_k, _d) for _k, _d in _MOSSIMG_DEFAULTS},
             **{_k: snapshot.get(_k, _d) for _k, _d in _PLAPRE_DEFAULTS},
             # FLUX.3 — the prompt the model actually received (upsampled and/or
@@ -1718,6 +1765,8 @@ class SEQUENCER_OT_add_to_queue(Operator):
             klein_visible_strips  = getattr(scene, "klein_visible_strips", 3),
             # Source strip names (carried through to metadata for Redo)
             **{f"klein_strip_{_n}": getattr(seq_scene, f"klein_strip_{_n}", "") for _n in range(1, 10)},
+            h3_ref_strip          = getattr(seq_scene, "h3_ref_strip", ""),
+            h3_last_strip         = getattr(seq_scene, "h3_last_strip", ""),
             minimax_subject_path  = self._render_named_strip_image(context, seq_scene, getattr(seq_scene, "minimax_subject", ""), target_res=(x, y)),
             **{f"flux_strip_{_n}_path":
                    self._render_named_strip_image(context, seq_scene, getattr(seq_scene, f"flux_strip_{_n}", ""), target_res=(x, y))
@@ -1775,6 +1824,7 @@ class SEQUENCER_OT_add_to_queue(Operator):
             **{_k: getattr(scene, _k, _d) for _k, _d in _YUE2_DEFAULTS},
             **{_k: getattr(scene, _k, _d) for _k, _d in _KREA2_REF_DEFAULTS},
             **{_k: getattr(scene, _k, _d) for _k, _d in _FLUX3_DEFAULTS},
+            **{_k: getattr(scene, _k, _d) for _k, _d in _FIBO2_DEFAULTS},
             **{_k: getattr(scene, _k, _d) for _k, _d in _MOSSIMG_DEFAULTS},
             **{_k: getattr(scene, _k, _d) for _k, _d in _PLAPRE_DEFAULTS},
             drama3_voices_json    = drama3_voices_to_json(scene),
@@ -1897,19 +1947,19 @@ class SEQUENCER_OT_add_to_queue(Operator):
                     strip.frame_final_duration if raw_frames < 0 else max(1, abs(raw_frames))
                 )
                 _ltx_num_frames = align_frames_8n1(_ltx_target_frames)
-                print(f"[Queue][dbg] LTX-2.3 job: strip '{strip.name}' target "
+                _dbg(f"[Queue][dbg] LTX-2.3 job: strip '{strip.name}' target "
                       f"{_ltx_target_frames} fr → 8n+1 aligned {_ltx_num_frames} fr")
 
             if strip is not None:
                 image_path, movie_path, sound_path, last_image_path, middle_images_json, control_video_path, control_audio_path = self._paths_from_strip(strip)
-                print(f"[Queue][dbg] loop strip='{strip.name}' type={strip.type} otype={otype} "
+                _dbg(f"[Queue][dbg] loop strip='{strip.name}' type={strip.type} otype={otype} "
                       f"input_mode={input_mode} → image_path={image_path!r} movie_path={movie_path!r} "
                       f"sound_path={sound_path!r} last_image_path={last_image_path!r} "
                       f"middle_images_json={middle_images_json!r} "
                       f"control_video_path={control_video_path!r} control_audio_path={control_audio_path!r}")
                 if strip.type == "META":
                     _child_summary = [(c.name, c.type) for c in strip.strips]
-                    print(f"[Queue][dbg] main strip '{strip.name}' is META, children: {_child_summary}")
+                    _dbg(f"[Queue][dbg] main strip '{strip.name}' is META, children: {_child_summary}")
 
                 # Render audio to a trimmed WAV so the job never holds a pointer to
                 # the full source file (avoids CUDA OOM when frame count is derived
@@ -1963,7 +2013,7 @@ class SEQUENCER_OT_add_to_queue(Operator):
                 # came out txt2img" looks like to the user).
                 if strip.type == "SCENE" and not (image_path or movie_path) and otype != "3d":
                     from ..utils.helpers import render_strip_to_path
-                    print(f"[Queue][dbg] SCENE block ENTERED for '{strip.name}', "
+                    _dbg(f"[Queue][dbg] SCENE block ENTERED for '{strip.name}', "
                           f"rendering (otype={otype})…")
                     _diag(f"SCENE block ENTERED for '{strip.name}' otype={otype}")
                     _want_video = (otype == "movie")
@@ -2172,7 +2222,7 @@ class SEQUENCER_OT_add_to_queue(Operator):
 
             mode = self._detect_mode(otype, image_path, movie_path,
                                      inpaint_strip if strip is None else "")
-            print(f"[Queue][dbg] mode-detect otype={otype} image_path={image_path!r} "
+            _dbg(f"[Queue][dbg] mode-detect otype={otype} image_path={image_path!r} "
                   f"movie_path={movie_path!r} inpaint={inpaint_strip!r} → mode={mode}")
             _diag(f"queue enqueue: strip={(strip.name, strip.type) if strip is not None else None} "
                   f"otype={otype} input_mode={input_mode} image_path={image_path!r} "
@@ -2260,13 +2310,24 @@ class SEQUENCER_OT_add_to_queue(Operator):
                                 context, _h3_ref_s, image_output=False,
                                 num_frames=_H3_REF_VIDEO_MAX_FRAMES,
                             )
-                            print(f"[Queue][dbg] H3 Ref Strip '{_h3_ref_s.name}' trimmed "
+                            _dbg(f"[Queue][dbg] H3 Ref Strip '{_h3_ref_s.name}' trimmed "
                                   f"{_h3_ref_s.frame_final_duration}→{_H3_REF_VIDEO_MAX_FRAMES} frames → {_h3_p!r}")
                         else:
                             from ..utils.helpers import get_strip_path as _get_strip_path
                             _h3_p = _get_strip_path(_h3_ref_s)
                         if _h3_p and os.path.isfile(_h3_p):
                             job.h3_ref_strip_path = _h3_p
+
+                # pika_h3_flex — "Last Frame" strip (image, or a movie's first frame)
+                job.h3_last_strip_path = ""
+                _h3_last_name = getattr(seq_scene, "h3_last_strip", "")
+                if _h3_last_name and se:
+                    _h3_last_s = se.strips.get(_h3_last_name)
+                    if _h3_last_s:
+                        from ..utils.helpers import get_strip_path as _get_strip_path
+                        _h3_lp = _get_strip_path(_h3_last_s)
+                        if _h3_lp and os.path.isfile(_h3_lp):
+                            job.h3_last_strip_path = _h3_lp
 
                 # IC-LoRA / V2 — resolved at queue time so the worker is self-contained
                 job.ltx23ic_control_video_path = control_video_path
@@ -2295,7 +2356,7 @@ class SEQUENCER_OT_add_to_queue(Operator):
                 if not control_video_path:
                     _ctrl_name = getattr(seq_scene, "ltx23ic_control_strip", "")
                     _ctrl_s = se.strips.get(_ctrl_name) if (_ctrl_name and se) else None
-                    print(f"[Queue][dbg] Ref Strip: name={_ctrl_name!r} "
+                    _dbg(f"[Queue][dbg] Ref Strip: name={_ctrl_name!r} "
                           f"resolved_type={getattr(_ctrl_s, 'type', None)!r}")
                     if _ctrl_s and _ctrl_s.type == "MOVIE":
                         try:
@@ -2315,7 +2376,7 @@ class SEQUENCER_OT_add_to_queue(Operator):
                                     if _cp_ds:
                                         _cp = _cp_ds
                                 job.ltx23ic_control_video_path = _cp
-                                print(f"[Queue][dbg] Ref Strip (MOVIE) → control_video_path={_cp!r}")
+                                _dbg(f"[Queue][dbg] Ref Strip (MOVIE) → control_video_path={_cp!r}")
                         except Exception:
                             pass
                     elif _ctrl_s and _ctrl_s.type == "SCENE":
@@ -2331,7 +2392,7 @@ class SEQUENCER_OT_add_to_queue(Operator):
                             print(f"[Queue] Ref Strip SCENE render raised: {_ctrl_scene_err!r}")
                         if _cp:
                             job.ltx23ic_control_video_path = _cp
-                            print(f"[Queue][dbg] Ref Strip (SCENE, rendered) → control_video_path={_cp!r}")
+                            _dbg(f"[Queue][dbg] Ref Strip (SCENE, rendered) → control_video_path={_cp!r}")
                         else:
                             self.report(
                                 {"WARNING"},
@@ -2341,10 +2402,10 @@ class SEQUENCER_OT_add_to_queue(Operator):
                             print(f"[Queue] Ref Strip SCENE render returned no file for '{_ctrl_s.name}'")
                     elif _ctrl_s and _ctrl_s.type == "IMAGE":
                         job.ltx23ic_ref_image_path = _image_strip_path(_ctrl_s)
-                        print(f"[Queue][dbg] Ref Strip (IMAGE) → ref_image_path={job.ltx23ic_ref_image_path!r}")
+                        _dbg(f"[Queue][dbg] Ref Strip (IMAGE) → ref_image_path={job.ltx23ic_ref_image_path!r}")
                     elif _ctrl_s and _ctrl_s.type == "META":
                         _child_summary = [(c.name, c.type) for c in _ctrl_s.strips]
-                        print(f"[Queue][dbg] Ref Strip META '{_ctrl_s.name}' children: {_child_summary}")
+                        _dbg(f"[Queue][dbg] Ref Strip META '{_ctrl_s.name}' children: {_child_summary}")
                         for _c in _ctrl_s.strips:
                             try:
                                 if _c.type == "MOVIE" and not job.ltx23ic_control_video_path:
@@ -2364,7 +2425,7 @@ class SEQUENCER_OT_add_to_queue(Operator):
                                             if _cp_ds:
                                                 _cp = _cp_ds
                                         job.ltx23ic_control_video_path = _cp
-                                        print(f"[Queue][dbg] Ref Strip META child '{_c.name}' (MOVIE) → control_video_path={_cp!r}")
+                                        _dbg(f"[Queue][dbg] Ref Strip META child '{_c.name}' (MOVIE) → control_video_path={_cp!r}")
                                 elif _c.type == "SCENE" and not job.ltx23ic_control_video_path:
                                     from ..utils.helpers import render_meta_child_to_path
                                     _cp = render_meta_child_to_path(
@@ -2374,12 +2435,12 @@ class SEQUENCER_OT_add_to_queue(Operator):
                                     )
                                     if _cp:
                                         job.ltx23ic_control_video_path = _cp
-                                        print(f"[Queue][dbg] Ref Strip META child '{_c.name}' (SCENE, rendered) → control_video_path={_cp!r}")
+                                        _dbg(f"[Queue][dbg] Ref Strip META child '{_c.name}' (SCENE, rendered) → control_video_path={_cp!r}")
                                     else:
                                         print(f"[Queue] Ref Strip META child SCENE '{_c.name}' render returned no file")
                                 elif _c.type == "IMAGE" and not job.ltx23ic_ref_image_path:
                                     job.ltx23ic_ref_image_path = _image_strip_path(_c)
-                                    print(f"[Queue][dbg] Ref Strip META child '{_c.name}' (IMAGE) → ref_image_path={job.ltx23ic_ref_image_path!r}")
+                                    _dbg(f"[Queue][dbg] Ref Strip META child '{_c.name}' (IMAGE) → ref_image_path={job.ltx23ic_ref_image_path!r}")
                                 elif (_c.type == "SOUND"
                                       and not job.ltx23ic_control_audio_path
                                       and getattr(_c, "sound", None)):
@@ -2394,7 +2455,7 @@ class SEQUENCER_OT_add_to_queue(Operator):
                                             if _ap_ds:
                                                 _ap = _ap_ds
                                         job.ltx23ic_control_audio_path = _ap
-                                        print(f"[Queue][dbg] Ref Strip META child '{_c.name}' (SOUND) → control_audio_path={_ap!r}")
+                                        _dbg(f"[Queue][dbg] Ref Strip META child '{_c.name}' (SOUND) → control_audio_path={_ap!r}")
                             except Exception as _child_err:
                                 print(f"[Queue] Ref Strip META child '{_c.name}' resolution error: {_child_err!r}")
                     elif _ctrl_s is not None:
@@ -2530,12 +2591,13 @@ def _queue_start_job(scene, job) -> None:
         *(_k for _k, _d in _YUE2_DEFAULTS),
         *(_k for _k, _d in _KREA2_REF_DEFAULTS),
         *(_k for _k, _d in _FLUX3_DEFAULTS),
+        *(_k for _k, _d in _FIBO2_DEFAULTS),
         *(_k for _k, _d in _MOSSIMG_DEFAULTS),
         *(_k for _k, _d in _PLAPRE_DEFAULTS),
         "drama3_voices_json",
         "stem_split_model", "stem_split_vocals", "stem_split_drums",
         "stem_split_bass", "stem_split_other", "stem_split_guitar", "stem_split_piano",
-        "h3_ref_strip_path",
+        "h3_ref_strip_path", "h3_last_strip_path", "h3_ref_strip", "h3_last_strip",
         "qwen_strip_1_path", "qwen_strip_2_path", "qwen_strip_3_path",
         *(f"klein_strip_{_n}_path" for _n in range(1, 10)),
         *(f"klein_strip_{_n}" for _n in range(1, 10)),
@@ -3153,6 +3215,10 @@ def _queue_insert_strip(scene, result: dict) -> None:
             for _k in (f"klein_strip_{_n}" for _n in range(1, _klein_count + 1)):
                 if result.get(_k):
                     extra_meta[_k] = result.get(_k)
+            # MiniMax H3 / Pika H3 Flex picker names (paths go via the generic block below)
+            for _k in ("h3_ref_strip", "h3_last_strip"):
+                if result.get(_k):
+                    extra_meta[_k] = result.get(_k)
             # ltx23_extend — write the resolved audio-strip path when present
             if result.get("ltx23ext_audio_path"):
                 extra_meta["ltx23ext_audio_path"] = result.get("ltx23ext_audio_path", "")
@@ -3220,6 +3286,11 @@ def _queue_insert_strip(scene, result: dict) -> None:
                 _final = result.get("flux3_final_prompt", "")
                 if _final and _final != result.get("prompt", ""):
                     extra_meta["flux3_final_prompt"] = _final
+            # Bria Fibo 2.0 — settings always written so Redo resets every one
+            # (the reference strip names ride klein_strip_N, the caption the prompt).
+            if result.get("model_card", "") in _FIBO2_CARDS:
+                for _k, _def in _FIBO2_DEFAULTS:
+                    extra_meta[_k] = result.get(_k, _def)
             # MOSS-Image — settings always written so Redo resets every one
             if result.get("model_card", "") in _MOSSIMG_CARDS:
                 for _k, _def in _MOSSIMG_DEFAULTS:
@@ -3245,7 +3316,7 @@ def _queue_insert_strip(scene, result: dict) -> None:
             for _k in (
                 "image_path", "last_image_path", "middle_images_json",
                 "movie_path", "sound_path", "ref_audio_path", "ref_text",
-                "kontext_strip_1_path", "h3_ref_strip_path",
+                "kontext_strip_1_path", "h3_ref_strip_path", "h3_last_strip_path",
                 "qwen_strip_1_path", "qwen_strip_2_path", "qwen_strip_3_path",
                 *(f"klein_strip_{_n}_path" for _n in range(1, 10)),
             ):
@@ -3568,6 +3639,9 @@ class SEQUENCER_OT_redo_from_job(Operator):
         for _attr in (f"klein_strip_{_n}" for _n in range(1, 10)):
             if hasattr(scene, _attr):
                 setattr(scene, _attr, getattr(job, _attr, ""))
+        for _attr in ("h3_ref_strip", "h3_last_strip"):
+            if hasattr(scene, _attr):
+                setattr(scene, _attr, getattr(job, _attr, ""))
         # Chatterbox Multilingual
         if hasattr(scene, "chatterbox_mtl_language"):
             scene.chatterbox_mtl_language    = job.chatterbox_mtl_language
@@ -3603,6 +3677,13 @@ class SEQUENCER_OT_redo_from_job(Operator):
                     _v = "sdnq8"  # renamed option
                 try:
                     setattr(scene, _k, _v)
+                except Exception:
+                    pass
+        # Bria Fibo 2.0 settings
+        if hasattr(scene, "fibo2_weights"):
+            for _k, _d in _FIBO2_DEFAULTS:
+                try:
+                    setattr(scene, _k, getattr(job, _k))
                 except Exception:
                     pass
         # MOSS-Image settings

@@ -4323,6 +4323,14 @@ class SEQUENCER_OT_redo_from_metadata(bpy.types.Operator):
                     setattr(scene, _attr, str(_v))
                 except Exception:
                     pass
+        # MiniMax H3 / Pika H3 Flex Ref Strip + Last Frame pickers.
+        for _attr in ("h3_ref_strip", "h3_last_strip"):
+            _v = _get(_attr)
+            if _v is not None and hasattr(scene, _attr):
+                try:
+                    setattr(scene, _attr, str(_v))
+                except Exception:
+                    pass
         _v = _get("klein_visible_strips")
         if _v is not None and hasattr(scene, "klein_visible_strips"):
             try:
@@ -4407,6 +4415,31 @@ class SEQUENCER_OT_redo_from_metadata(bpy.types.Operator):
                     _v = _def
                 elif _attr == "flux3_weights" and str(_v) == "sdnq":
                     _v = "sdnq8"  # renamed option (strips made before 8/4-bit)
+                elif isinstance(_def, bool):
+                    # Metadata may hold the bool as text: bool("False") is True.
+                    _v = str(_v).lower() in ("true", "1", "yes")
+                try:
+                    setattr(scene, _attr, type(_def)(_v))
+                except Exception:
+                    pass
+
+        # Bria Fibo 2.0 — reset every setting for a Fibo 2 strip (missing keys →
+        # default). Reference strip names ride klein_strip_N and the JSON caption
+        # rides the prompt (both restored above).
+        if str(model or "") in (
+            "ml-resources/Fibo-2.0-dev",
+            "ml-resources/Fibo-2.0-edit-turbo",
+            "briaai/Fibo-2.0-dev",
+            "briaai/Fibo-2.0-edit-turbo",
+        ) and hasattr(scene, "fibo2_weights"):
+            for _attr, _def in (
+                ("fibo2_weights",     "sdnq8"),
+                ("fibo2_render_text", True),
+                ("fibo2_font_path",   ""),
+            ):
+                _v = _get(_attr)
+                if _v is None:
+                    _v = _def
                 elif isinstance(_def, bool):
                     # Metadata may hold the bool as text: bool("False") is True.
                     _v = str(_v).lower() in ("true", "1", "yes")
@@ -4580,6 +4613,7 @@ class AI_Metadata_PT_Panel(bpy.types.Panel):
             "yue2_guidance", "yue2_vae_tile_frames", "yue2_vae_tile_overlap",
             "krea2_ref_mode", "krea2_ref_subject", "krea2_ref_style", "krea2_ref_grounding_px",
             "flux3_weights", "flux3_prompt_upsampling", "flux3_pup_quant", "flux3_final_prompt",
+            "fibo2_weights", "fibo2_render_text", "fibo2_font_path",
             "mossimg_weights", "mossimg_guidance_mode", "mossimg_skip_layers",
             "mossimg_slg_scale", "mossimg_shift",
             "plapre_speaker", "plapre_sentence_pause", "plapre_max_pause",
@@ -4599,6 +4633,8 @@ class AI_Metadata_PT_Panel(bpy.types.Panel):
             "krea2_ref_style": "Ref. Style", "krea2_ref_grounding_px": "Grounding (px)",
             "flux3_weights": "Weights", "flux3_prompt_upsampling": "Prompt Upsampling",
             "flux3_pup_quant": "Upsampler Quant", "flux3_final_prompt": "Final Prompt",
+            "fibo2_weights": "Weights", "fibo2_render_text": "Render Text Images",
+            "fibo2_font_path": "Extra Font",
             "mossimg_weights": "Weights", "mossimg_guidance_mode": "Layer Guidance",
             "mossimg_skip_layers": "Skip Layers", "mossimg_slg_scale": "SLG Scale",
             "mossimg_shift": "Shift",

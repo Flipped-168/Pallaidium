@@ -25,10 +25,109 @@ H3 is guidance-distilled: no CFG, no negative_prompt. Fixed 24fps, 5-15s
 duration (frame counts snapped to the model's 17*n+5 grid).
 """
 
+from contextlib import contextmanager
+
 from ...models.base import ModelPlugin, InputSpec, UISection, ParamSpec, ModelInputs
 from ...utils.helpers import gfx_device, low_vram, solve_path, clean_filename
 
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+
+
+def _cached_snapshot_dir(repo_id, cache_dir=None):
+    """Newest-by-ref snapshot folder of a repo in the local HF cache.
+
+    huggingface_hub.snapshot_download(local_files_only=True) refuses a repo
+    whose README/LICENSE/.gitattributes were never fetched ("incomplete
+    snapshot") even when every file the pipeline needs is present, so resolve
+    the folder from refs/main directly. Raises OSError when nothing is cached.
+    """
+    import os
+    from huggingface_hub import constants
+    root = os.path.join(cache_dir or constants.HF_HUB_CACHE, "models--" + repo_id.replace("/", "--"))
+    with open(os.path.join(root, "refs", "main"), encoding="utf-8") as f:
+        snap = os.path.join(root, "snapshots", f.read().strip())
+    if not os.path.isdir(snap):
+        raise FileNotFoundError(snap)
+    return snap
+
+
+def _onload_vae_per_call(vae, device):
+    """Keep `vae` on CPU, moving its weights to `device` only inside encode()/decode().
+
+    Resident VAEs (~5.5GB video + audio) sat on the GPU through every denoise
+    step, pushing a 768x1536 t2va step to 16.4GB allocated / 20.3GB reserved —
+    past 24GB once the desktop's share is added, so Windows spilled into shared
+    memory. Group offload can't help here (it hooks forward(), and the
+    pipeline calls .encode()/.decode() directly), so wrap those two methods.
+
+    Offload restores the original CPU tensors instead of copying GPU->CPU, for
+    the same heap-leak reason as ensure_group_offload_keep_cpu_weights(). The
+    pipeline already places VAE inputs on _execution_device (the transformer's
+    onload device), never on vae.device, so the CPU-side idle state is safe.
+    """
+    import functools
+    import itertools
+    cpu_data = {t: t.data for t in itertools.chain(vae.parameters(), vae.buffers())}
+    depth = [0]
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        def inner(*args, **kwargs):
+            if depth[0] == 0:
+                for tensor, data in cpu_data.items():
+                    tensor.data = data.to(device)
+            depth[0] += 1
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                depth[0] -= 1
+                if depth[0] == 0:
+                    for tensor, data in cpu_data.items():
+                        tensor.data = data
+        return inner
+
+    vae.encode = wrap(vae.encode)
+    vae.decode = wrap(vae.decode)
+
+
+@contextmanager
+def _queue_progress(plugin, inputs):
+    """Forward the denoise loop's tqdm steps to the render-queue progress bar.
+
+    The loop calls LoopSequentialPipelineBlocks.progress_bar() on a block
+    instance buried in the pipeline's block tree, so patch the class method
+    for the duration of the call. When the last step lands, switch the phase
+    to "Decoding" — the VAE decode that follows takes a while with no steps.
+    """
+    if inputs.progress_fn is None:
+        yield
+        return
+    from diffusers.modular_pipelines.modular_pipeline import LoopSequentialPipelineBlocks
+    orig = LoopSequentialPipelineBlocks.progress_bar
+
+    def progress_bar(self, iterable=None, total=None):
+        bar = orig(self, iterable=iterable, total=total)
+        bar_update = bar.update
+
+        def update(n=1):
+            out = bar_update(n)
+            steps = bar.total or 0
+            try:
+                inputs.progress_fn(bar.n, steps)
+                if steps and bar.n >= steps:
+                    plugin.set_phase(inputs, "Decoding")
+            except Exception:
+                pass
+            return out
+
+        bar.update = update
+        return bar
+
+    LoopSequentialPipelineBlocks.progress_bar = progress_bar
+    try:
+        yield
+    finally:
+        LoopSequentialPipelineBlocks.progress_bar = orig
 
 
 class MiniMaxH3Plugin(ModelPlugin):
@@ -76,41 +175,49 @@ class MiniMaxH3Plugin(ModelPlugin):
         print(f"Loading {repo_id} (t2va + fl2va + ref2va, all workflows)…")
         # No workflow= at either call: keeps both transformer partitions
         # resident so the plugin can route per-job at generate() time.
-        # Cache-first: once downloaded, load everything (weights AND the repos'
-        # trust_remote_code .py files) from the local HF cache. Going online
-        # every load costs a round-trip per file and silently picks up upstream
-        # code changes — a remote VAE update once broke decode mid-job. Only
-        # fall back to the network for what isn't cached yet. (diffusers still
-        # prints "Downloading code from …" for cached code; nothing downloads.)
+        # Cache-first: once downloaded, load everything from the local HF cache.
+        # Going online every load costs a round-trip per file. Only fall back
+        # to the network for what isn't cached yet.
         try:
-            pipe = ModularPipeline.from_pretrained(repo_id, trust_remote_code=True, cache_dir=_cache_dir, local_files_only=True)
+            pipe = ModularPipeline.from_pretrained(repo_id, cache_dir=_cache_dir, local_files_only=True)
             from_cache = True
         except (OSError, ValueError):
             if _lfo:
                 raise
-            pipe = ModularPipeline.from_pretrained(repo_id, trust_remote_code=True, cache_dir=_cache_dir, local_files_only=False)
+            pipe = ModularPipeline.from_pretrained(repo_id, cache_dir=_cache_dir, local_files_only=False)
             from_cache = False
-        pipe.load_components(dtype=dtype, trust_remote_code=True, cache_dir=_cache_dir, local_files_only=_lfo or from_cache)
+        # The pruned repo's transformer/transformer_ref/vae are remote-code
+        # classes (type_hint null -> AutoModel + trust_remote_code). They're
+        # vendored beside this plugin, so point the specs at them instead: no
+        # code fetched from the Hub, and upstream code changes can't silently
+        # alter (or break) a job.
+        from ._minimax_h3_pruned import MiniMaxH3PrunedTransformer3DModel
+        from ._minimax_h3_vae_fp16 import MiniMaxH3Fp16DecoderVae
+        for _name, _cls in (("transformer", MiniMaxH3PrunedTransformer3DModel),
+                            ("transformer_ref", MiniMaxH3PrunedTransformer3DModel),
+                            ("vae", MiniMaxH3Fp16DecoderVae)):
+            pipe._component_specs[_name].type_hint = _cls
         if from_cache:
-            # Some components fail local-only by repo id even though fully
-            # cached: `processor`'s inner tokenizer probes a processor/config.json
-            # the repo doesn't have — online that's a quick 404, local-only a
-            # hard error. Loading from the cached snapshot folder sidesteps it.
-            from huggingface_hub import snapshot_download
-            for name in [n for n in pipe._component_specs if getattr(pipe, n, None) is None]:
-                repo = pipe._component_specs[name].pretrained_model_name_or_path
-                if not repo:
+            # Load every component from its cached snapshot folder rather than
+            # by repo id: `processor`'s inner tokenizer probes a
+            # processor/config.json the repo doesn't have — online that's a
+            # quick 404, local-only a hard error (and a long traceback).
+            for name, spec in list(pipe._component_specs.items()):
+                if spec.default_creation_method != "from_pretrained" or getattr(pipe, name, None) is not None:
                     continue
                 try:
-                    local_dir = snapshot_download(repo, cache_dir=_cache_dir, local_files_only=True)
-                except (OSError, ValueError):
-                    continue
+                    local_dir = _cached_snapshot_dir(spec.pretrained_model_name_or_path, _cache_dir)
+                except OSError:
+                    continue  # not cached — fetched online below
                 pipe.load_components(names=name, pretrained_model_name_or_path=local_dir, dtype=dtype,
-                                     trust_remote_code=True, cache_dir=_cache_dir, local_files_only=True)
-            uncached = [n for n in pipe._component_specs if getattr(pipe, n, None) is None]
+                                     cache_dir=_cache_dir, local_files_only=True)
+            uncached = [n for n, sp in pipe._component_specs.items()
+                        if sp.default_creation_method == "from_pretrained" and getattr(pipe, n, None) is None]
             if uncached and not _lfo:
                 print(f"MiniMax H3: not in local cache, fetching online: {uncached}")
-                pipe.load_components(names=uncached, dtype=dtype, trust_remote_code=True, cache_dir=_cache_dir, local_files_only=False)
+                pipe.load_components(names=uncached, dtype=dtype, cache_dir=_cache_dir, local_files_only=False)
+        else:
+            pipe.load_components(dtype=dtype, cache_dir=_cache_dir, local_files_only=_lfo)
         # load_components() logs a per-component failure as a warning and leaves
         # the attribute None instead of raising — fail loudly here instead of
         # letting the first .model/.enable_group_offload() access below crash
@@ -155,9 +262,17 @@ class MiniMaxH3Plugin(ModelPlugin):
                 name = clean_filename(item.name).replace(".", "")
                 names.append(name)
                 weights.append(item.weight_value)
-                pipe.load_lora_weights(
-                    lora_folder, weight_name=item.name + ".safetensors", adapter_name=name,
-                )
+                # Silence diffusers' "LoRA does not say which partition" notice:
+                # we deliberately load into both partitions, one call each.
+                from diffusers.utils import logging as _dlog
+                _prev = _dlog.get_verbosity()
+                _dlog.set_verbosity_error()
+                try:
+                    pipe.load_lora_weights(
+                        lora_folder, weight_name=item.name + ".safetensors", adapter_name=name,
+                    )
+                finally:
+                    _dlog.set_verbosity(_prev)
                 try:
                     pipe.load_lora_weights(
                         lora_folder, weight_name=item.name + ".safetensors", adapter_name=name,
@@ -209,11 +324,10 @@ class MiniMaxH3Plugin(ModelPlugin):
         pipe.transformer.enable_group_offload(offload_type="block_level", num_blocks_per_group=2, **offload)
         pipe.transformer_ref.enable_group_offload(offload_type="block_level", num_blocks_per_group=1, **offload)
         apply_group_offloading(pipe.text_encoder.model, offload_type="leaf_level", **offload)
-        # VAEs stay fully on-GPU: they're small, and block-level offload hooks
-        # a module's forward(), which pipelines calling .encode()/.decode()
-        # directly never trigger — weights would be stranded on CPU otherwise.
-        pipe.vae.to(gfx_device)
-        pipe.audio_vae.to(gfx_device)
+        # VAEs: block-level offload hooks forward(), which the pipeline's direct
+        # .encode()/.decode() calls never trigger — so onload per call instead.
+        _onload_vae_per_call(pipe.vae, onload_device)
+        _onload_vae_per_call(pipe.audio_vae, onload_device)
 
         return {"pipe": pipe, "bits": bits}
 
@@ -269,8 +383,7 @@ class MiniMaxH3Plugin(ModelPlugin):
 
         # No callback_on_step_end: MiniMaxH3Blocks doesn't declare it as an
         # input (diffusers warns "Unexpected input... will be ignored" if
-        # passed), so Blender's own progress bar can't track per-step
-        # progress here — watch the console's native tqdm step counter instead.
+        # passed). Per-step progress comes from _queue_progress() instead.
         common = dict(
             prompt=inputs.prompt,
             height=h,
@@ -283,10 +396,12 @@ class MiniMaxH3Plugin(ModelPlugin):
 
         if not primary_image and not ref_path and not audio_path:
             self.set_phase(inputs, "Generating (t2va)")
-            result = pipe(**common)
+            with _queue_progress(self, inputs):
+                result = pipe(**common)
         elif primary_image is not None and not ref_path and not audio_path:
             self.set_phase(inputs, "Generating (fl2va)")
-            result = pipe(image=primary_image, **common)
+            with _queue_progress(self, inputs):
+                result = pipe(image=primary_image, **common)
         else:
             self.set_phase(inputs, "Generating (ref2va)")
             references = []
@@ -300,7 +415,8 @@ class MiniMaxH3Plugin(ModelPlugin):
                     references.append(MiniMaxH3ImageReference.from_file(ref_path))
             if audio_path:
                 references.append(MiniMaxH3AudioReference.from_file(audio_path))
-            result = pipe(references=references, **common)
+            with _queue_progress(self, inputs):
+                result = pipe(references=references, **common)
 
         self.set_phase(inputs, "Saving")
         video = result["videos"][0]
