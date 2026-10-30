@@ -23,6 +23,8 @@ _SR           = 24000
 _AUDIO_VOCAB  = 12800
 _REF_AUDIO_CAP = 250           # voice-reference audio tokens (10 s at 25 Hz)
 _MAX_NEW_TOKENS = 500          # 20 s per sentence
+_TOKENS_PER_CHAR = 2.2         # measured speaking rate, used only to estimate progress
+_PROGRESS_STEPS = 1000
 _SILENCE_DB   = -40.0          # frame counts as silent this far below the clip's loudest frame
 _EDGE_KEEP_S  = 0.02           # breath of silence left at each trimmed edge
 _SPEAKERS_JSON = os.path.join(
@@ -128,7 +130,7 @@ class Plapre3Plugin(ModelPlugin):
     def load(self, prefs, scene, **kw):
         import torch
         from huggingface_hub import hf_hub_download
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from kanade_tokenizer import KanadeModel, load_vocoder
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -142,9 +144,21 @@ class Plapre3Plugin(ModelPlugin):
             from transformers import PreTrainedTokenizerFast
             tokenizer = PreTrainedTokenizerFast.from_pretrained(_REPO, local_files_only=local)
 
+        # config.json carries two RoPE thetas: top-level rope_theta=10000 (what
+        # transformers 4.57 read when the model was trained) and
+        # rope_parameters.rope_theta=100000 (what transformers 5 reads). The
+        # 100000 one makes long sentences loop and repeat words, so force the
+        # top-level value.
+        config = AutoConfig.from_pretrained(_REPO, local_files_only=local)
+        with open(hf_hub_download(_REPO, "config.json", local_files_only=local), encoding="utf-8") as fh:
+            trained_theta = json.load(fh).get("rope_theta")
+        rope_params = getattr(config, "rope_parameters", None)
+        if trained_theta and isinstance(rope_params, dict) and rope_params.get("rope_theta") != trained_theta:
+            config.rope_parameters = {**rope_params, "rope_theta": trained_theta}
+
         # fp32 is the training precision; lower precision adds end-of-utterance artifacts.
         model = AutoModelForCausalLM.from_pretrained(
-            _REPO, dtype=torch.float32, local_files_only=local,
+            _REPO, config=config, dtype=torch.float32, local_files_only=local,
         ).to(device).eval()
 
         speaker_proj = torch.nn.Linear(128, model.config.hidden_size)
@@ -195,6 +209,7 @@ class Plapre3Plugin(ModelPlugin):
         import soundfile as sf
         import torch
         from kanade_tokenizer import vocode
+        from transformers import StoppingCriteria, StoppingCriteriaList
 
         model        = pipe_obj["model"]
         tokenizer    = pipe_obj["tokenizer"]
@@ -242,6 +257,30 @@ class Plapre3Plugin(ModelPlugin):
         sentences = _split_sentences(inputs.prompt)
         print(f"Plapre 3 | voice={voice_label} | temperature={temperature:.2f} | sentences={len(sentences)}")
 
+        # Progress: each sentence gets a share of the bar proportional to its
+        # length, filled per generated token against an estimated token count.
+        should_cancel = inputs.should_cancel
+        progress_fn = inputs.progress_fn
+        weights = [max(1, len(s_)) for s_ in sentences]
+        total_w = float(sum(weights)) or 1.0
+        state = {"base": 0.0, "share": 0.0, "expected": 1.0, "last": -1}
+
+        def _report(fraction):
+            step = int(_PROGRESS_STEPS * min(1.0, fraction))
+            if progress_fn is not None and step != state["last"]:
+                state["last"] = step
+                progress_fn(step, _PROGRESS_STEPS)
+
+        class _TokenProgress(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kw):
+                # With inputs_embeds, input_ids holds only the generated tokens.
+                done = min(0.95, input_ids.shape[-1] / state["expected"])
+                _report(state["base"] + state["share"] * done)
+                cancel = bool(should_cancel and should_cancel())
+                return torch.full((input_ids.shape[0],), cancel, dtype=torch.bool, device=input_ids.device)
+
+        stopping = StoppingCriteriaList([_TokenProgress()])
+
         embed = model.get_input_embeddings()
         with torch.no_grad():
             spk_hidden = speaker_proj(spk_emb.to(device).float()).unsqueeze(0)
@@ -258,6 +297,7 @@ class Plapre3Plugin(ModelPlugin):
                     max_new_tokens=_MAX_NEW_TOKENS,
                     do_sample=True, temperature=temperature, top_p=0.95, top_k=50,
                     eos_token_id=stops, pad_token_id=tokenizer.eos_token_id,
+                    stopping_criteria=stopping,
                 )[0].tolist()
             content = []
             for t in out:
@@ -271,9 +311,15 @@ class Plapre3Plugin(ModelPlugin):
         silence = np.zeros(int(sentence_pause * _SR), dtype=np.float32)
         chunks = []
         for i, sentence in enumerate(sentences):
+            if should_cancel and should_cancel():
+                print("Plapre 3: cancelled")
+                break
             print(f"[{i + 1}/{len(sentences)}] {sentence[:60]}")
+            state["base"] = sum(weights[:i]) / total_w
+            state["share"] = weights[i] / total_w
+            state["expected"] = max(1.0, min(_MAX_NEW_TOKENS, _TOKENS_PER_CHAR * len(sentence)))
             content = _synth(sentence)
-            if not content:
+            if not content and not (should_cancel and should_cancel()):
                 print("  no audio tokens - retrying once")
                 content = _synth(sentence)
             if content:
@@ -288,8 +334,7 @@ class Plapre3Plugin(ModelPlugin):
                 chunks.append(_tighten_pauses(wav.squeeze().float().cpu().numpy(), max_pause))
             else:
                 print("  skipped: no audio generated")
-            if inputs.progress_fn is not None:
-                inputs.progress_fn(i + 1, len(sentences))
+            _report(sum(weights[: i + 1]) / total_w)
 
         output_path = solve_path(clean_filename(str(seed) + "_" + inputs.prompt) + ".wav")
         if chunks:

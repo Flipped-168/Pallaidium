@@ -35,6 +35,7 @@ _WEIGHT_ALIAS = {"sdnq": "sdnq8"}  # older scenes/metadata
 
 _PUP_ID   = "black-forest-labs/flux-3-image-klein-pup"
 _MAX_REFS = 10  # model and upsampler limit; the input strip + 9 Ref. pickers
+_MAX_REF_PIXELS = 1024 * 1024  # per reference, as in BFL's Space
 
 # Total VRAM (GiB) to keep the whole pipeline resident, per weight source.
 # SDNQ 8-bit peaks at ~15.4 GiB at 2048x1152 (OzzyGT); below the threshold the
@@ -348,6 +349,13 @@ class _Flux3KleinBase(ModelPlugin):
         if missing:
             raise RuntimeError(f"FLUX.3: failed to load {', '.join(missing)} (see the console above)")
 
+        # Decode in 2048 px tiles only when a side is over 2048 px, as BFL's
+        # Space does: a 4K decode in one piece runs out of memory.
+        vae = pipe.vae
+        vae.use_tiling = True
+        vae.tile_sample_min_size = 2048
+        vae.tile_latent_min_size = 2048 // (2 ** (len(vae.config.block_out_channels) - 1))
+
         self._load_loras(pipe, scene, kw.get("enabled_items") or [], weights)
 
         on_gpu = gfx_device == "cuda" and self._resident(weights)
@@ -505,6 +513,14 @@ class _Flux3KleinBase(ModelPlugin):
         if len(refs) > _MAX_REFS:
             print(f"FLUX.3: {len(refs)} references, keeping the first {_MAX_REFS}")
             refs = refs[:_MAX_REFS]
+        # BFL's Space caps every reference at 1 MP; diffusers only shrinks
+        # above 16 MP, so a 4K strip would cost 8x the tokens and VRAM.
+        for i, img in enumerate(refs):
+            pixels = img.width * img.height
+            if pixels > _MAX_REF_PIXELS:
+                scale = (_MAX_REF_PIXELS / pixels) ** 0.5
+                refs[i] = img.resize((max(16, round(img.width * scale)), max(16, round(img.height * scale))),
+                                     _PILImage.Resampling.LANCZOS)
         return refs
 
     def generate(self, pipe_obj, inputs: ModelInputs, scene, prefs):
@@ -737,6 +753,7 @@ class Flux3KleinBasePlugin(_Flux3KleinBase):
         UISection.RESOLUTION, UISection.FRAMES, UISection.STEPS, UISection.GUIDANCE,
         UISection.SEED, UISection.LORA,
     ]
-    # Pipeline defaults: 50 steps, guidance 3.5 (BFL recommendation).
-    PARAMS       = ParamSpec(steps=50, guidance=3.5)
+    # 50 steps, guidance 4.0 (BFL's recommendation, raised from 3.5 in the
+    # official Space's defaults).
+    PARAMS       = ParamSpec(steps=50, guidance=4.0)
     DISTILLED    = False

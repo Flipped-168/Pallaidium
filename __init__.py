@@ -30,6 +30,9 @@ os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
 # that set it inside generate() do so too late to have any effect. setdefault
 # keeps it overridable.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Windows torch builds ignore expandable_segments and warn once about it.
+import warnings as _warnings
+_warnings.filterwarnings("ignore", message=".*expandable_segments not supported.*")
 
 
 def _find_msvc_cl():
@@ -775,6 +778,8 @@ def register():
 
     # minimax_h3 — second reference strip (ref2va), image or video
     bpy.types.Scene.h3_ref_strip                = bpy.props.StringProperty(name="H3 Ref Strip",         default="",  description="Name of a second reference strip (image or video) for MiniMax H3's ref2va mode")
+    # pika_h3_flex — last-frame keyframe strip (fl2va)
+    bpy.types.Scene.h3_last_strip               = bpy.props.StringProperty(name="H3 Last Frame",        default="",  description="Name of an image strip (or a movie strip, whose first frame is used) the Pika H3 Flex video ends on")
 
     # ltx23_multi_ic_lora — IC-LoRA control params
     bpy.types.Scene.ltx23ic_control_strip       = bpy.props.StringProperty(name="IC-LoRA Ref Strip",    default="",  description="Name of the IC-LoRA reference strip (META or MOVIE)")
@@ -1383,6 +1388,39 @@ def register():
         description="Precision of the prompt upsampler",
     )
 
+    # Bria Fibo 2.0 (reference images ride the klein_strip_N pickers; JSON captions
+    # and <image_N> references ride the prompt text)
+    bpy.types.Scene.fibo2_weights = bpy.props.EnumProperty(
+        name="Weights",
+        items=[
+            ("sdnq8", "SDNQ 8-bit", "Transformer and text encoder quantized to 8-bit while loading "
+                                    "(~13 GB VRAM). Quality close to the original"),
+            ("sdnq4", "SDNQ 4-bit", "Transformer and text encoder quantized to 4-bit while loading "
+                                    "(~8 GB VRAM). For GPUs with 12 GB or less"),
+            ("bf16",  "BF16",       "Full-precision Hub weights (~26 GB; needs ~30 GB VRAM or CPU "
+                                    "offload). Most reliable with LoRAs"),
+        ],
+        default="sdnq8",
+        description="Which Fibo 2 weights to load. Changing it reloads the model",
+    )
+    bpy.types.Scene.fibo2_render_text = bpy.props.BoolProperty(
+        name="Render Text Images",
+        default=True,
+        description=(
+            "Draw each text_render entry of a JSON caption as a small image the model reads to "
+            "spell it correctly. Turn off for captions without text"
+        ),
+    )
+    bpy.types.Scene.fibo2_font_path = bpy.props.StringProperty(
+        name="Extra Font",
+        subtype="FILE_PATH",
+        default="",
+        description=(
+            "Font file (.ttf/.otf) used to draw characters the built-in font lacks, e.g. "
+            "non-Latin scripts. Empty = built-in font only"
+        ),
+    )
+
     # MOSS-Image Base / SFT (layout boxes ride the prompt text, written by the Box Editor)
     bpy.types.Scene.mossimg_weights = bpy.props.EnumProperty(
         name="Weights",
@@ -1765,6 +1803,9 @@ def unregister():
     for _prop in ("flux3_weights", "flux3_prompt_upsampling", "flux3_pup_quant"):
         if hasattr(bpy.types.Scene, _prop):
             delattr(bpy.types.Scene, _prop)
+    for _prop in ("fibo2_weights", "fibo2_render_text", "fibo2_font_path"):
+        if hasattr(bpy.types.Scene, _prop):
+            delattr(bpy.types.Scene, _prop)
     for _prop in ("mossimg_weights", "mossimg_guidance_mode", "mossimg_skip_layers",
                   "mossimg_slg_scale", "mossimg_shift"):
         if hasattr(bpy.types.Scene, _prop):
@@ -1777,7 +1818,7 @@ def unregister():
     for _prop in ("chatterbox_mtl_language",):
         if hasattr(bpy.types.Scene, _prop):
             delattr(bpy.types.Scene, _prop)
-    for _prop in ("h3_ref_strip",):
+    for _prop in ("h3_ref_strip", "h3_last_strip"):
         if hasattr(bpy.types.Scene, _prop):
             delattr(bpy.types.Scene, _prop)
     for _prop in (

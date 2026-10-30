@@ -217,6 +217,19 @@ excluded from the built add-on.
 
 ## Change Log
 
+2026-10-29: Add: **Pika H3 Flex** — Pika's six-step post-train of MiniMax-H3 ([Pika-Labs/Pika-H3-Flex](https://huggingface.co/Pika-Labs/Pika-H3-Flex), MiniMax H3 Community License). It generates video with a synchronized 32 kHz stereo soundtrack in **6 steps** (fixed; no CFG, no negative prompt). The mode follows the inputs:
+- **Text to video + audio:** prompt only.
+- **First / last / first+last frame:** the Input image and/or the new **Last Frame** strip picker (an image strip, or a movie strip's first frame). A META strip holding two images at different frame starts also works as first + last.
+- **Reference video:** a **Ref Strip** (image or video, shared with MiniMax H3) and/or **Audio Ref.**, with the Input image as an extra image reference. A last frame can't be combined with references and is ignored there.
+
+Prompts are free-form. Describe the shots and camera moves with timings (e.g. `0-3 s: wide shot …`), then add a `Sound:` line for effects, dialogue and music. Video and audio references must run 2–15 s: shorter video references fall back to their first frame as an image reference, shorter audio references are ignored, and longer ones are cut to 15 s. Resolution snaps to Pika's validated 480p / 768p sizes (11 aspect ratios each, e.g. 832×480, 480×832, 1344×768, 768×1344), and length snaps to the model's frame grid at 24 fps: 124–362 frames (5–15 s). Speed on a 24 GB card at 4-bit: about 40–65 s per step at 768×1344 for 5 s; the 480p sizes are roughly 2.5× faster and suit drafts. Pika's own repo ships the base model in bf16 (66 GB per transformer, plus a 66 GB text encoder), so the plugin loads the same OzzyGT SDNQ-pruned MiniMax-H3 weights as MiniMax H3 (4-bit, or 8-bit with ≥ 64 GB RAM; no second download if MiniMax H3 is already cached). Pika's two rank-128 adapters go on top (2 × 2.8 GB, downloaded on first use), plus any user LoRAs. The Ref Strip and Last Frame pickers are saved in the strip metadata and restored by Redo. Needs **Install Dependencies** (latest diffusers, for `PikaH3FlexBlocks`) and a restart of Blender.
+
+2026-10-29: Fix: **Input paths are now saved in the strip metadata.** The queue was dropping the input image, last image, movie, sound, Audio Ref. and Text Ref. paths before writing an output strip's metadata, so Redo couldn't restore them. They are now written for every model, and Redo puts the image, movie, sound, Audio Ref. and Text Ref. paths back into the scene. Note that a restored path stays set for later prompt-only jobs until you clear it.
+
+2026-10-21: Add: **Bria Fibo 2.0** and **Bria Fibo 2.0 Edit Turbo** — Bria's 8B structured-caption model ([ml-resources/Fibo-2.0-dev](https://huggingface.co/ml-resources/Fibo-2.0-dev), 50 steps, guidance 5, negative prompt; [Fibo-2.0-edit-turbo](https://huggingface.co/ml-resources/Fibo-2.0-edit-turbo), 4 steps, no guidance, editing only) via diffusers' `BriaFibo2Pipeline`. The prompt is a plain description or edit instruction, or a JSON caption (`short_description`, `objects`, `text_render`, `edit_instruction`, …). **Editing:** the active input strip plus the Klein-style **Ref.** pickers (up to 4 images in all, addressed as `<image_1>`…`<image_4>` in the prompt); an inpaint mask turns it into a masked edit of one image. **Render Text Images** and **Extra Font** control the small text images the model reads (the repo's Aileron and DejaVu Sans fonts are always used as fallbacks) to spell `text_render` entries. **Weights:** SDNQ 8-bit (default), SDNQ 4-bit or BF16, quantized while loading. LoRAs are attempted through the pipeline. Weights, text-image options, references, mask, negative prompt and seed are stored in the strip metadata and restored by Redo. Weights come from the ungated [ml-resources](https://huggingface.co/ml-resources) mirrors of Bria's originals, so no Hugging Face login is needed; the license is CC BY-NC 4.0 (non-commercial). Needs **Install Dependencies** (latest diffusers) and a restart of Blender.
+
+2026-10-18: Add: **SAM-Audio Large** — Meta's [facebook/sam-audio-large](https://huggingface.co/facebook/sam-audio-large) sound-isolation model (SAM License). Select a SOUND strip (for a video, its audio strip), pick "Sound Isolation: SAM-Audio Large" in the Audio panel and describe the sound in the prompt (e.g. `a dog barking`, `female speech`, `piano`): the strip is split into two SOUND strips, **target** (the described sound) and **residual** (everything else), at 48 kHz. Weights load from the ungated mirror [ml-resources/sam-audio-large](https://huggingface.co/ml-resources/sam-audio-large) (14.9 GB download, ~8 GB VRAM resident in bf16, peaking at ~14 GB on a full 30 s chunk) plus T5-base; no Hugging Face login is needed. Long clips are separated in 30 s chunks. Span prompts, visual prompts and reranking are not supported yet. Needs **Install Dependencies** for `sam-audio`, `dacvae`, `perception-models`, `descript-audiotools` and `argbind`, then a restart of Blender.
+
 2026-10-17: Add: **MOSS-Image Base** and **MOSS-Image SFT** — OpenMOSS' 5B single-stream DiT ([Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base), the LoRA training target; [SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT), fine-tuned for cleaner text grouping and layout), Apache-2.0. Strong English/Chinese text rendering (put `
 ` or real line breaks in the prompt to control line breaks), prompts up to 4K tokens, arbitrary aspect ratios from 0.25 to 4 megapixels (1-2 MP recommended; sizes snap to multiples of 16). Defaults follow the official guide: 50 Euler steps, CFG 3 (3-6 for short prompts), shift 5, and **Layer Guidance** "Uncond Skip" on layer 22; "Standard SLG" (scale 3) and "Off" (the most realistic look, but details may collapse) are selectable, as are the skip layers (22, 24 and 26 all help) and the shift. Suggested negative prompt: `nsfw, worst quality, bad anatomy, watermark, jpeg artifact`. Features:
 - **Layouts via the Box Editor:** Box Editor JSON and FLUX.3 layout prompts are converted to MOSS-Image's centred-pixel `yxyx` layout JSON for the output size. A layout draft from the official `moss-image-prompt-enhancer` skill (`abs`/`xyxy` with its own width/height) is compiled and rescaled to the output size, and a compiled MOSS layout prompt passes through unchanged. (Experimental upstream.)
@@ -610,6 +623,7 @@ https://github.com/tin2tin/Generative_AI/assets/1322593/2dd2d2f1-a1f6-4562-8116-
 - [Wan-AI/Wan2.1-I2V](https://huggingface.co/Wan-AI)
 - [SkyReels-V1-Hunyuan-I2V/T2V](https://huggingface.co/Skywork/SkyReels-V1-Hunyuan-I2V)
 - [MiniMax Cloud API](https://www.minimaxi.com/)
+- [Pika-Labs/Pika-H3-Flex](https://huggingface.co/Pika-Labs/Pika-H3-Flex) adapters on [OzzyGT/MiniMax_H3_sdnq_4bit_pruned](https://huggingface.co/OzzyGT/MiniMax_H3_sdnq_4bit_pruned) / [8bit_pruned](https://huggingface.co/OzzyGT/MiniMax_H3_sdnq_8bit_pruned)
 
 ### Image:
 - [diffusers/FLUX.2-dev-bnb-4bit](https://huggingface.co/diffusers/FLUX.2-dev-bnb-4bit)
@@ -632,6 +646,7 @@ https://github.com/tin2tin/Generative_AI/assets/1322593/2dd2d2f1-a1f6-4562-8116-
 - [Ming-Image 0.1 Design](https://huggingface.co/OzzyGT/ming_image_0_1_design_diffusers)
 - [black-forest-labs/flux-3-image-klein](https://huggingface.co/black-forest-labs/flux-3-image-klein) / [-base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base) / [-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup)
 - [OpenMOSS-Team/MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) / [-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT)
+- [briaai/Fibo-2.0-dev](https://huggingface.co/briaai/Fibo-2.0-dev) / [-edit-turbo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) (CC BY-NC 4.0), loaded from the ungated mirrors [ml-resources/Fibo-2.0-dev](https://huggingface.co/ml-resources/Fibo-2.0-dev) / [-edit-turbo](https://huggingface.co/ml-resources/Fibo-2.0-edit-turbo)
 
 ### Audio:
 - [Chatterbox / Chatterbox Turbo](https://github.com/resemble-ai/chatterbox)
@@ -644,6 +659,7 @@ https://github.com/tin2tin/Generative_AI/assets/1322593/2dd2d2f1-a1f6-4562-8116-
 - [YuE2-3B (songs with vocals)](https://huggingface.co/OzzyGT/YuE2-3B-Diffusers)
 - [stabilityai/stable-audio-open-1.0](https://huggingface.co/stabilityai/stable-audio-open-1.0)
 - [Stem Splitter (demucs-onnx)](https://github.com/StemSplit/demucs-onnx)
+- [SAM-Audio Large (sound isolation)](https://huggingface.co/facebook/sam-audio-large) ([code](https://github.com/facebookresearch/sam-audio))
 
 ### Background Removal:
 - [BiRefNet_HR](https://huggingface.co/ZhengPeng7/BiRefNet_HR)
