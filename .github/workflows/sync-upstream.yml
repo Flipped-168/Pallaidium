@@ -22,13 +22,26 @@ jobs:
         run: git fetch upstream
       - name: Merge upstream (ours strategy)
         run: |
-          git merge upstream/HEAD --no-edit -X ours || git merge FETCH_HEAD --no-edit -X ours
-      - name: Keep only our workflow
+          git merge upstream/HEAD --no-edit -X ours || git merge FETCH_HEAD --no-edit -X ours || true
+      - name: Resolve conflicts
+        run: |
+          for f in $(git diff --name-only --diff-filter=U); do
+            if [ "$f" = ".github/workflows/sync-upstream.yml" ]; then
+              git checkout --ours -- "$f" 2>/dev/null || true
+              git add "$f"
+            elif echo "$f" | grep -q '^\.github/workflows/'; then
+              git rm -f "$f" || true
+            else
+              git checkout --ours -- "$f"
+              git add "$f"
+            fi
+          done
+          git commit -m "chore: resolve merge conflicts" --allow-empty || true
+      - name: Preserve fork workflow
         run: |
           mkdir -p .github/workflows
           find .github/workflows -type f ! -name "sync-upstream.yml" -delete
-      - name: Commit and push
-        run: |
-          git add .github/workflows
+          git add -f .github/workflows
           git commit -m "chore: preserve fork sync workflow" --allow-empty
-          git push
+      - name: Push
+        run: git push
